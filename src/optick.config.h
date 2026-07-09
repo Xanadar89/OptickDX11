@@ -53,6 +53,15 @@
 #define OPTICK_ENABLE_GPU (USE_OPTICK /*&& 0*/)
 #endif //OPTICK_ENABLE_GPU
 
+// D3D11
+#if !defined(OPTICK_ENABLE_GPU_D3D11)
+#if defined(_MSC_VER)
+#define OPTICK_ENABLE_GPU_D3D11 (OPTICK_ENABLE_GPU /*&& 0*/)
+#else
+#define OPTICK_ENABLE_GPU_D3D11 (0)
+#endif
+#endif
+
 // D3D12
 #if !defined(OPTICK_ENABLE_GPU_D3D12)
 #if defined(_MSC_VER)
