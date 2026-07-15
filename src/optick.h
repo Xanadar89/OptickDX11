@@ -150,6 +150,10 @@ typedef void (VKAPI_PTR *PFN_vkFreeCommandBuffers_)(VkDevice device, VkCommandPo
 struct ID3D12CommandList;
 struct ID3D12Device;
 struct ID3D12CommandQueue;
+
+// D3D11 Forward Declarations
+struct ID3D11Device;
+struct ID3D11DeviceContext;
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace Optick
@@ -762,6 +766,7 @@ struct OPTICK_API GPUContext
 };
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 OPTICK_API void InitGpuD3D12(ID3D12Device* device, ID3D12CommandQueue** cmdQueues, uint32_t numQueues);
+OPTICK_API void InitGpuD3D11(ID3D11Device* device, ID3D11DeviceContext* context, uint32_t numQueues);
 OPTICK_API void InitGpuVulkan(VkDevice* vkDevices, VkPhysicalDevice* vkPhysicalDevices, VkQueue* vkQueues, uint32_t* cmdQueuesFamily, uint32_t numQueues, const VulkanFunctions* functions);
 OPTICK_API void GpuFlip(void* swapChain);
 OPTICK_API GPUContext SetGpuContext(GPUContext context);
@@ -1024,6 +1029,7 @@ struct OptickApp
 
 // GPU events
 #define OPTICK_GPU_INIT_D3D12(DEVICE, CMD_QUEUES, NUM_CMD_QUEUS)													::Optick::InitGpuD3D12(DEVICE, CMD_QUEUES, NUM_CMD_QUEUS);
+#define OPTICK_GPU_INIT_D3D11(DEVICE, CONTEXT, NUM_ADAPTERS)														::Optick::InitGpuD3D11(DEVICE, CONTEXT, NUM_ADAPTERS);
 #define OPTICK_GPU_INIT_VULKAN(DEVICES, PHYSICAL_DEVICES, CMD_QUEUES, CMD_QUEUES_FAMILY, NUM_CMD_QUEUS, FUNCTIONS)	::Optick::InitGpuVulkan(DEVICES, PHYSICAL_DEVICES, CMD_QUEUES, CMD_QUEUES_FAMILY, NUM_CMD_QUEUS, FUNCTIONS);
 
 // Setup GPU context:

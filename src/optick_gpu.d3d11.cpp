@@ -32,7 +32,7 @@
 #include <atomic>
 #include <thread>
 
-#include <d3d11_1.h>
+#include <d3d11_4.h>
 #include <dxgi.h>
 #include <dxgi1_5.h>
 
@@ -41,17 +41,21 @@
 
 namespace Optick
 {
+	template <class T> void SafeRelease(T** ppT)
+	{
+		if (*ppT)
+		{
+			(*ppT)->Release();
+			*ppT = NULL;
+		}
+	}
+
 	class GPUProfilerD3D11 : public GPUProfiler
 	{
 		struct Frame
 		{
-			//ID3D12CommandAllocator* commandAllocator;
-			//ID3D12GraphicsCommandList* commandList;
 			ID3D11Query* queryDisjoint = nullptr;
-			ID3D11Query* statisticsQuery = nullptr;
-
-			std::array<ID3D11Query*, MAX_QUERIES_COUNT> stamps{};
-
+			
 			Frame()
 			{
 				Reset();
@@ -71,10 +75,9 @@ namespace Optick
 
 		struct NodePayload
 		{
-			//ID3D12CommandQueue* commandQueue;
-			//ID3D12QueryHeap* queryHeap;
-			//ID3D11Fence* syncFence;
 			array<Frame, NUM_FRAMES_DELAY> frames;
+			std::array<ID3D11Query*, MAX_QUERIES_COUNT> stamps{};
+			ID3D11Fence* syncFence = nullptr;
 
 			NodePayload() //: commandQueue(nullptr), queryHeap(nullptr), syncFence(nullptr)
 			{}
@@ -82,9 +85,12 @@ namespace Optick
 		};
 		vector<NodePayload*> nodePayloads;
 
-		//ID3D12Resource* queryBuffer;
+		bool isSignalingSupported = false;
 		ID3D11Device* device;
 		ID3D11DeviceContext* context;
+
+		ID3D11Device5* device5 = nullptr;
+		ID3D11DeviceContext4* context4 = nullptr;
 
 		// VSync Stats
 		DXGI_FRAME_STATISTICS prevFrameStatistics;
@@ -110,9 +116,9 @@ namespace Optick
 		// Interface implementation
 		ClockSynchronization GetClockSynchronization(uint32_t nodeIndex) override;
 
-		void QueryTimestamp(void* context, int64_t* outCpuTimestamp) override
+		void QueryTimestamp(void* inContext, int64_t* outCpuTimestamp) override
 		{
-			QueryTimestamp((ID3D11DeviceContext*)context, outCpuTimestamp);
+			QueryTimestamp(context, outCpuTimestamp);
 		}
 
 		void Flip(void* swapChain) override
@@ -120,15 +126,6 @@ namespace Optick
 			Flip(static_cast<IDXGISwapChain*>(swapChain));
 		}
 	};
-
-	template <class T> void SafeRelease(T **ppT)
-	{
-		if (*ppT)
-		{
-			(*ppT)->Release();
-			*ppT = NULL;
-		}
-	}
 
 	void InitGpuD3D11(ID3D11Device* device, ID3D11DeviceContext* context, uint32_t numQueues)
 	{
@@ -152,7 +149,8 @@ namespace Optick
 			Memory::Delete(node);
 		nodes.clear();
 
-		//SafeRelease(&queryBuffer);
+		SafeRelease(&device5);
+		SafeRelease(&context4);
 	}
 
 	void GPUProfilerD3D11::InitDevice(ID3D11Device* pDevice, ID3D11DeviceContext* pCommandQueues, uint32_t numCommandQueues)
@@ -160,8 +158,11 @@ namespace Optick
 		device = pDevice;
 		context = pCommandQueues;
 
+		device->QueryInterface(&device5);
+		context->QueryInterface(&context4);
+		isSignalingSupported = device5 && context4;
+		
 		uint32_t nodeCount = 1; // numCommandQueues; // pDevice->GetNodeCount();
-
 
 		nodes.resize(nodeCount);
 		nodePayloads.resize(nodeCount);
@@ -175,7 +176,7 @@ namespace Optick
 		DXGI_ADAPTER_DESC desc;
 		adapter->GetDesc(&desc);
 
-		adapter->Release();
+		SafeRelease(&adapter);
 
 		char deviceName[128] = { 0 };
 		wcstombs_s(deviceName, desc.Description, OPTICK_ARRAY_SIZE(deviceName) - 1);
@@ -198,6 +199,11 @@ namespace Optick
 		//OPTICK_CHECK(device->CreateQueryHeap(&queryHeapDesc, IID_PPV_ARGS(&node->queryHeap)));
 		//OPTICK_CHECK(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&node->syncFence)));
 
+		if (isSignalingSupported)
+		{
+			device5->CreateFence(0, D3D11_FENCE_FLAG_NONE, IID_PPV_ARGS(&node->syncFence));
+		}
+
 		for (Frame& frame : node->frames)
 		{
 			//OPTICK_CHECK(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&frame.commandAllocator)));
@@ -213,16 +219,17 @@ namespace Optick
 		{
 			uint32_t index = nodes[currentNode]->QueryTimestamp(outCpuTimestamp);
 
-			ID3D11Query* timestampQuery;
-			D3D11_QUERY_DESC qDesc{
-				D3D11_QUERY_TIMESTAMP,
-				0
-			};
-			device->CreateQuery(&qDesc, &timestampQuery);
-			context->End(timestampQuery);
-
-			uint32_t currentFrameIndex = frameNumber % NUM_FRAMES_DELAY;
-			nodePayloads[currentNode]->frames[currentFrameIndex].stamps[index] = timestampQuery;
+			if (nodePayloads[currentNode]->stamps[index] == nullptr) // Create 8K queries from the start?
+			{
+				ID3D11Query* timestampQuery;
+				D3D11_QUERY_DESC qDesc{
+					D3D11_QUERY_TIMESTAMP,
+					0
+				};
+				device->CreateQuery(&qDesc, &timestampQuery);
+				nodePayloads[currentNode]->stamps[index] = timestampQuery;
+			}
+			context->End(nodePayloads[currentNode]->stamps[index]);
 		}
 	}
 
@@ -231,16 +238,19 @@ namespace Optick
 		if (count)
 		{
 			Node* node = nodes[currentNode];
-
-			D3D12_RANGE range = { sizeof(uint64_t)*startIndex, sizeof(uint64_t)*(startIndex + count) };
-			void* pData = nullptr;
-			queryBuffer->Map(0, &range, &pData);
-			memcpy(&node->queryGpuTimestamps[startIndex], (uint64_t*)pData + startIndex, sizeof(uint64_t) * count);
-			queryBuffer->Unmap(0, 0);
+			NodePayload* payload = nodePayloads[currentNode];
 
 			// Convert GPU timestamps => CPU Timestamps
 			for (uint32_t index = startIndex; index < startIndex + count; ++index)
+			{
+				//auto getDataRet = context->GetData(payload->stamps[index], &node->queryGpuTimestamps[index], sizeof(uint64_t), 0) == S_OK;
+				//OPTICK_ASSERT(getDataRet, "Timestamps should be ready at this point");
+
+				while (context->GetData(payload->stamps[index], &node->queryGpuTimestamps[index], sizeof(uint64_t), 0) == S_FALSE)
+				{}
+
 				*node->queryCpuTimestamps[index] = node->clock.GetCPUTimestamp(node->queryGpuTimestamps[index]);
+			}
 		}
 	}
 
@@ -249,9 +259,21 @@ namespace Optick
 		OPTICK_EVENT();
 
 		NodePayload* payload = nodePayloads[currentNode];
-		while (frameNumberToWait > payload->syncFence->GetCompletedValue())
+		if (isSignalingSupported)
 		{
-			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			while (frameNumberToWait > payload->syncFence->GetCompletedValue())
+			{
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			}
+		}
+		else {
+			OPTICK_ASSERT(false, "WaitForFrame with Disjoint is not implemented yet");
+			//uint32_t frameIndexToWait = frameNumberToWait % NUM_FRAMES_DELAY;
+			//D3D11_QUERY_DATA_TIMESTAMP_DISJOINT tsDisjoint;
+			//while (context->GetData(payload->frames[frameIndexToWait].queryDisjoint, &tsDisjoint, sizeof(D3D11_QUERY_DATA_TIMESTAMP_DISJOINT), 0) == S_FALSE)
+			//{
+			//	std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			//}
 		}
 	}
 
@@ -272,24 +294,28 @@ namespace Optick
 			uint32_t currentFrameIndex = frameNumber % NUM_FRAMES_DELAY;
 			uint32_t nextFrameIndex = (frameNumber + 1) % NUM_FRAMES_DELAY;
 
-			//Frame& currentFrame = frames[frameNumber % NUM_FRAMES_DELAY];
-			//Frame& nextFrame = frames[(frameNumber + 1) % NUM_FRAMES_DELAY];
-
 			QueryFrame& currentFrame = node.queryGpuframes[currentFrameIndex];
 			QueryFrame& nextFrame = node.queryGpuframes[nextFrameIndex];
 
-			ID3D12GraphicsCommandList* commandList = payload.frames[currentFrameIndex].commandList;
-			ID3D12CommandAllocator* commandAllocator = payload.frames[currentFrameIndex].commandAllocator;
-			commandAllocator->Reset();
-			commandList->Reset(commandAllocator, nullptr);
+			//ID3D12GraphicsCommandList* commandList = payload.frames[currentFrameIndex].commandList;
+			//ID3D12CommandAllocator* commandAllocator = payload.frames[currentFrameIndex].commandAllocator;
+			//commandAllocator->Reset();
+			//commandList->Reset(commandAllocator, nullptr);
 
 			if (EventData* frameEvent = currentFrame.frameEvent)
-				QueryTimestamp(commandList, &frameEvent->finish);
+				QueryTimestamp(context, &frameEvent->finish);
+
+			if (!isSignalingSupported)
+			{
+				// End disjoint query for this frame
+
+				// Begin disjoint query for next frame
+			}
 
 			// Generate GPU Frame event for the next frame
 			EventData& event = AddFrameEvent();
-			QueryTimestamp(commandList, &event.start);
-			QueryTimestamp(commandList, &AddFrameTag().timestamp);
+			QueryTimestamp(context, &event.start);
+			QueryTimestamp(context, &AddFrameTag().timestamp);
 			nextFrame.frameEvent = &event;
 
 			uint32_t queryBegin = currentFrame.queryIndexStart;
@@ -303,21 +329,21 @@ namespace Optick
 				uint32_t startIndex = queryBegin % MAX_QUERIES_COUNT;
 				uint32_t finishIndex = queryEnd % MAX_QUERIES_COUNT;
 
-				if (startIndex < finishIndex)
-				{
-					commandList->ResolveQueryData(payload.queryHeap, D3D12_QUERY_TYPE_TIMESTAMP, startIndex, queryEnd - queryBegin, queryBuffer, startIndex * sizeof(int64_t));
-				}
-				else
-				{
-					commandList->ResolveQueryData(payload.queryHeap, D3D12_QUERY_TYPE_TIMESTAMP, startIndex, MAX_QUERIES_COUNT - startIndex, queryBuffer, startIndex * sizeof(int64_t));
-					commandList->ResolveQueryData(payload.queryHeap, D3D12_QUERY_TYPE_TIMESTAMP, 0, finishIndex, queryBuffer, 0);
-				}
+				//if (startIndex < finishIndex)
+				//{
+				//	commandList->ResolveQueryData(payload.queryHeap, D3D12_QUERY_TYPE_TIMESTAMP, startIndex, queryEnd - queryBegin, queryBuffer, startIndex * sizeof(int64_t));
+				//}
+				//else
+				//{
+				//	commandList->ResolveQueryData(payload.queryHeap, D3D12_QUERY_TYPE_TIMESTAMP, startIndex, MAX_QUERIES_COUNT - startIndex, queryBuffer, startIndex * sizeof(int64_t));
+				//	commandList->ResolveQueryData(payload.queryHeap, D3D12_QUERY_TYPE_TIMESTAMP, 0, finishIndex, queryBuffer, 0);
+				//}
 			}
 
-			commandList->Close();
-
-			payload.commandQueue->ExecuteCommandLists(1, (ID3D12CommandList*const*)&commandList);
-			payload.commandQueue->Signal(payload.syncFence, frameNumber);
+			//commandList->Close();
+			//payload.commandQueue->ExecuteCommandLists(1, (ID3D12CommandList*const*)&commandList);
+			
+			context4->Signal(payload.syncFence, frameNumber);
 
 			// Preparing Next Frame
 			// Try resolve timestamps for the current frame
@@ -331,7 +357,7 @@ namespace Optick
 				if (resolveFinish > MAX_QUERIES_COUNT)
 					ResolveTimestamps(0, resolveFinish - MAX_QUERIES_COUNT);
 			}
-				
+
 			nextFrame.queryIndexStart = queryEnd;
 			nextFrame.queryIndexCount = 0;
 
@@ -355,24 +381,61 @@ namespace Optick
 		ClockSynchronization clock;
 		clock.frequencyCPU = GetHighPrecisionFrequency();
 
+		D3D11_QUERY_DESC disDesc {
+			D3D11_QUERY_TIMESTAMP_DISJOINT,
+			0
+		};
+		D3D11_QUERY_DESC timeDesc{
+			D3D11_QUERY_TIMESTAMP,
+			0
+		};
+		ID3D11Query* disQuery = nullptr;
+		ID3D11Query* timeQuery = nullptr;
+		OPTICK_CHECK( device->CreateQuery(&disDesc, &disQuery) );
+		OPTICK_CHECK( device->CreateQuery(&timeDesc, &timeQuery) );
+		context->Begin(disQuery);
+		context->End(timeQuery);
+		context->End(disQuery);
+
+		context->Flush();
+
+		D3D11_QUERY_DATA_TIMESTAMP_DISJOINT tsDisjoint;
+		while (context->GetData(disQuery, &tsDisjoint, sizeof(D3D11_QUERY_DATA_TIMESTAMP_DISJOINT), 0) == S_FALSE)
+		{ }
+
 		LARGE_INTEGER cpuCounter;
-		OPTICK_ASSERT(QueryPerformanceCounter(&cpuCounter));
+		bool perfCount = QueryPerformanceCounter(&cpuCounter);
+		OPTICK_ASSERT(perfCount, "Cant't get CPU performance counter");
 		clock.timestampCPU = cpuCounter.QuadPart;
-		//nodePayloads[nodeIndex]->commandQueue->GetTimestampFrequency((uint64_t*)&clock.frequencyGPU);
-		//nodePayloads[nodeIndex]->commandQueue->GetClockCalibration((uint64_t*)&clock.timestampGPU, (uint64_t*)&clock.timestampCPU);
+
+		OPTICK_ASSERT(tsDisjoint.Disjoint == false, "Query is disjoint");
+
+		uint64_t gpuTime = 0;
+		auto getDataRet = context->GetData(timeQuery, &gpuTime, sizeof(uint64_t), 0) == S_OK;
+		OPTICK_ASSERT(getDataRet, "Can't get data from timeQuery");
+
+		clock.timestampGPU = static_cast<int64_t>(gpuTime); // unsigned to signed, what could go wrong? 
+		clock.frequencyGPU = static_cast<int64_t>(tsDisjoint.Frequency);
+
+		SafeRelease(&disQuery);
+		SafeRelease(&timeQuery);
+
 		return clock;
 	}
 
 	GPUProfilerD3D11::NodePayload::~NodePayload()
 	{
-		//SafeRelease(&queryHeap);
-		//SafeRelease(&syncFence);
+		SafeRelease(&syncFence);
+
+		for (int i = 0; i < stamps.size(); ++i)
+		{
+			SafeRelease(&stamps[i]);
+		}
 	}
 
 	void GPUProfilerD3D11::Frame::Shutdown()
 	{
-		//SafeRelease(&commandAllocator);
-		//SafeRelease(&commandList);
+		SafeRelease(&queryDisjoint);
 	}
 }
 
